@@ -16,8 +16,6 @@ from gi.repository import Gst, GLib
 # Initialize GStreamer
 Gst.init(None)
 
-# Import Retinex processing function
-from retinex import underwater_retinex_gpu
 
 class GstreamerRTPSource:
     """Class to handle GStreamer RTP video source"""
@@ -118,7 +116,7 @@ class GstreamerRTPSource:
 class CameraCaptureApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Dual RTP Camera Feed with Retinex")
+        self.root.title("Dual RTP Camera Feed")
                 
         # Initialize GStreamer video sources
         self.rtp_source1 = GstreamerRTPSource(port=5000)
@@ -164,38 +162,22 @@ class CameraCaptureApp:
         # Capture buttons frame
         self.capture_frame = ttk.Frame(self.control_frame)
         self.capture_frame.pack(side=tk.TOP, fill=tk.X, pady=5)
-        
+                
         # Capture button for Feed 1
         self.btn_capture1 = ttk.Button(
             self.capture_frame, 
             text="Capture Feed 1", 
-            command=lambda: self.capture_retinex_frames(1)
+            command=lambda: self.capture_frames(1)
         )
         self.btn_capture1.pack(side=tk.LEFT, padx=5)
-        
+
         # Capture button for Feed 2
         self.btn_capture2 = ttk.Button(
             self.capture_frame, 
             text="Capture Feed 2", 
-            command=lambda: self.capture_retinex_frames(2)
+            command=lambda: self.capture_frames(2)
         )
         self.btn_capture2.pack(side=tk.LEFT, padx=5)
-
-        # Capture button for Feed 1 (no Retinex)
-        self.btn_capture1_no_retinex = ttk.Button(
-            self.capture_frame, 
-            text="Capture Feed 1 (No Retinex)", 
-            command=lambda: self.capture_no_retinex_frames(1)
-        )
-        self.btn_capture1_no_retinex.pack(side=tk.LEFT, padx=5)
-
-        # Capture button for Feed 2 (no Retinex)
-        self.btn_capture2_no_retinex = ttk.Button(
-            self.capture_frame, 
-            text="Capture Feed 2 (No Retinex)", 
-            command=lambda: self.capture_no_retinex_frames(2)
-        )
-        self.btn_capture2_no_retinex.pack(side=tk.LEFT, padx=5)
 
         # Open captured frame folder
         self.btn_open_capture_folder = ttk.Button(
@@ -252,7 +234,7 @@ class CameraCaptureApp:
         self.process_var1 = tk.BooleanVar(value=False)
         self.chk_process1 = ttk.Checkbutton(
             self.view_frame,
-            text="Show Retinex on Feed 1",
+            text="Show Feed 1",
             variable=self.process_var1
         )
         self.chk_process1.pack(side=tk.LEFT, padx=20)
@@ -260,7 +242,7 @@ class CameraCaptureApp:
         self.process_var2 = tk.BooleanVar(value=False)
         self.chk_process2 = ttk.Checkbutton(
             self.view_frame,
-            text="Show Retinex on Feed 2",
+            text="Show Feed 2",
             variable=self.process_var2
         )
         self.chk_process2.pack(side=tk.LEFT, padx=20)
@@ -324,22 +306,14 @@ class CameraCaptureApp:
         except Exception as e:
             messagebox.showerror("Connection Error", f"Failed to connect to port {port}: {e}")
             status_label.config(text="Connection failed")
-    
-    def process_frame(self, frame, apply_retinex=False):
-        """Process frame with optional Retinex enhancement"""
+
+    def process_frame(self, frame):
         if frame is None:
             return None
-            
-        if apply_retinex:
-            try:
-                frame = underwater_retinex_gpu(frame)
-            except Exception as e:
-                print(f"Error applying Retinex: {e}")
-                # If Retinex fails, return the original frame
         return frame
-    
-    def capture_no_retinex_frames(self, feed_number):
-        """Capture 1 frame without Retinex processing from specified feed"""
+
+    def capture_frames(self, feed_number):
+        """Capture 1 frame processing from specified feed"""
         if feed_number == 1:
             rtp_source = self.rtp_source1
             status_label = self.status_label1
@@ -353,28 +327,8 @@ class CameraCaptureApp:
             return
 
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        filename = os.path.join(self.output_dir, f"feed{feed_number}_no_retinex_{timestamp}.jpg")
+        filename = os.path.join(self.output_dir, f"feed{feed_number}_{timestamp}.jpg")
         cv2.imwrite(filename, frame)
-        self.root.update()
-
-    def capture_retinex_frames(self, feed_number):
-        """Capture 1 frame with Retinex processing from specified feed"""
-        if feed_number == 1:
-            rtp_source = self.rtp_source1
-            status_label = self.status_label1
-        else:
-            rtp_source = self.rtp_source2
-            status_label = self.status_label2
-
-        frame = rtp_source.get_frame()
-        if frame is None:
-            messagebox.showerror("Error", f"No video stream available on Feed {feed_number}")
-            return
-
-        processed_frame = self.process_frame(frame, apply_retinex=True)
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        filename = os.path.join(self.output_dir, f"feed{feed_number}_retinex_{timestamp}.jpg")
-        cv2.imwrite(filename, processed_frame)
         self.root.update()
     
     def update_frames(self):
@@ -400,29 +354,13 @@ class CameraCaptureApp:
             
             # Schedule the next update
             self.root.after(30, self.update_frames)  # ~30 FPS
-    
-    def update_single_frame(self, rtp_source, cam_label, status_label, apply_retinex, feed_name):
+
+    def update_single_frame(self, rtp_source, cam_label, status_label, feed_name):
         """Update a single camera feed display"""
         # Get the current frame from the RTP source
         frame = rtp_source.get_frame()
         
-        if frame is not None:
-            # Apply Retinex if enabled in preview
-            if apply_retinex:
-                frame = self.process_frame(frame, apply_retinex=True)
-
-
-                frame_hash = hash(frame.tobytes())
-                if feed_name == "Feed 1":
-                    if self.last_frame_hash1 == frame_hash:
-                        return # skip update if frame is the same
-                    self.last_frame_hash1 = frame_hash
-                else:
-                    if self.last_frame_hash2 == frame_hash:
-                        return
-                    self.last_frame_hash2 = frame_hash
-
-            
+        if frame is not None:            
             # Convert to RGB for display
             display_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             
@@ -473,4 +411,5 @@ if __name__ == "__main__":
     print("Entering main loop!")
     
     # Start Tkinter event loop
+
     root.mainloop()
