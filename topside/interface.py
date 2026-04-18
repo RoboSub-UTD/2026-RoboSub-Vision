@@ -200,6 +200,7 @@ class GstreamerRTPSource:
         pipe_str = (
             f"udpsrc port={self.port} "
             f"caps=application/x-rtp,encoding-name=H264,payload=96 ! "
+            f"rtpjitterbuffer latency=50 drop-on-latency=true ! "
             f"rtph264depay ! avdec_h264 ! videoconvert ! "
             f"video/x-raw,format=BGR ! "
             f"appsink name=sink emit-signals=false max-buffers=1 drop=true sync=false"
