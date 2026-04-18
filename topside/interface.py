@@ -584,17 +584,14 @@ class MainWindow(QMainWindow):
         screen = QApplication.primaryScreen().availableGeometry()
         sw, sh = screen.width(), screen.height()
 
-        # Target 90% of screen, capped at 1920x1080, maintaining 16:9
-        target_w = min(int(sw * 0.92), 1920)
-        target_h = min(int(sh * 0.92), 1080)
-        # Enforce 16:9
-        if target_w / target_h > 16 / 9:
-            target_w = int(target_h * 16 / 9)
-        else:
+        # Target 88% of available screen height, enforce 16:9
+        target_h = min(int(sh * 0.88), 1080)
+        target_w = int(target_h * 16 / 9)
+        if target_w > int(sw * 0.95):
+            target_w = int(sw * 0.95)
             target_h = int(target_w * 9 / 16)
 
         self.resize(target_w, target_h)
-        # Center on screen
         self.move(
             screen.x() + (sw - target_w) // 2,
             screen.y() + (sh - target_h) // 2,
@@ -652,7 +649,14 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(12, 8, 12, 8)
         root.setSpacing(10)
 
-        hdr = QHBoxLayout()
+        # Header bar - fixed height so it never gets squished
+        self._header_widget = QWidget()
+        self._header_widget.setFixedHeight(40)
+        self._header_widget.setStyleSheet("background:#0f0f0f;")
+        hdr = QHBoxLayout(self._header_widget)
+        hdr.setContentsMargins(8, 4, 8, 4)
+        hdr.setSpacing(6)
+        root.addWidget(self._header_widget)
         title = QLabel("RoboSub Vision")
         font_size = max(11, int(self._screen_w / 130))
         title.setFont(QFont("Courier New", font_size, QFont.Weight.Bold))
@@ -692,7 +696,6 @@ class MainWindow(QMainWindow):
         self.btn_fullscreen.clicked.connect(self._toggle_fullscreen)
         hdr.addWidget(self.btn_fullscreen)
         hdr.addWidget(_button("Exit", self.close))
-        root.addLayout(hdr)
 
         self.feed1 = FeedPanel(1, 5000, self.output_dir, yolo_engine=self.yolo, main_window=self)
         self.feed2 = FeedPanel(2, 5001, self.output_dir, yolo_engine=self.yolo, main_window=self)
@@ -712,31 +715,100 @@ class MainWindow(QMainWindow):
         normal_layout.addWidget(divider)
         normal_layout.addWidget(self.photo_panel)
 
-        # Fullscreen view - three equal columns, no controls
+        # Fullscreen view - three columns with minimal controls
+        # Layout adapts to 16:9 by giving the two video feeds more width
+        # than the Pi Camera (which shows stills, not live video)
         self._fs_widget = QWidget()
-        fs_layout = QHBoxLayout(self._fs_widget)
-        fs_layout.setContentsMargins(0, 0, 0, 0)
-        fs_layout.setSpacing(4)
+        fs_root = QVBoxLayout(self._fs_widget)
+        fs_root.setContentsMargins(6, 4, 6, 4)
+        fs_root.setSpacing(4)
 
-        self._fs_feed1 = QLabel("Feed 1\nWaiting...")
+        fs_toolbar_widget = QWidget()
+        fs_toolbar_widget.setFixedHeight(36)
+        fs_toolbar_widget.setStyleSheet("background:#111; border-bottom:1px solid #222;")
+        fs_toolbar_container = QHBoxLayout(fs_toolbar_widget)
+        fs_toolbar_container.setContentsMargins(8, 2, 8, 2)
+        fs_toolbar_container.setSpacing(6)
+
+        fs_title = QLabel("RoboSub Vision")
+        fs_title.setFont(QFont("Courier New", 11, QFont.Weight.Bold))
+        fs_title.setStyleSheet("color:#00bfff; background:transparent;")
+        fs_toolbar_container.addWidget(fs_title)
+        fs_toolbar_container.addStretch()
+
+        # Mirror the main toggles
+        self._fs_btn_yolo = QPushButton("🦀  YOLO  OFF")
+        self._fs_btn_yolo.setCheckable(True)
+        self._fs_btn_yolo.setEnabled(self.yolo is not None and self.yolo.is_available())
+        self._fs_btn_yolo.setStyleSheet(
+            "QPushButton { background:#1a1a2a; color:#666; border:1px solid #333;"
+            "border-radius:4px; padding:3px 10px; font-size:11px; }"
+            "QPushButton:checked { background:#1a2a1a; color:#8f8; border-color:#3a5a3a; }"
+            "QPushButton:hover { border-color:#555; }")
+        self._fs_btn_yolo.toggled.connect(self._fs_sync_yolo)
+        fs_toolbar_container.addWidget(self._fs_btn_yolo)
+
+        self._fs_btn_pre = QPushButton("🌊  Preprocess  OFF")
+        self._fs_btn_pre.setCheckable(True)
+        self._fs_btn_pre.setStyleSheet(
+            "QPushButton { background:#1a1a2a; color:#666; border:1px solid #333;"
+            "border-radius:4px; padding:3px 10px; font-size:11px; }"
+            "QPushButton:checked { background:#1a2a2a; color:#4dd; border-color:#2a5a5a; }"
+            "QPushButton:hover { border-color:#555; }")
+        self._fs_btn_pre.toggled.connect(self._fs_sync_preprocess)
+        fs_toolbar_container.addWidget(self._fs_btn_pre)
+
+        self._fs_btn_capture = QPushButton("📷  Capture")
+        self._fs_btn_capture.setStyleSheet(
+            "QPushButton { background:#1a2a1a; color:#8f8; border:1px solid #3a5a3a;"
+            "border-radius:4px; padding:3px 10px; font-size:11px; }"
+            "QPushButton:hover { background:#223a22; }"
+            "QPushButton:pressed { background:#111; }")
+        self._fs_btn_capture.clicked.connect(self.photo_panel.trigger_capture)
+        fs_toolbar_container.addWidget(self._fs_btn_capture)
+
+        fs_exit_btn = QPushButton("⛶  Exit Fullscreen")
+        fs_exit_btn.setStyleSheet(
+            "QPushButton { background:#1e1e1e; color:#ccc; border:1px solid #333;"
+            "border-radius:4px; padding:3px 10px; font-size:11px; }"
+            "QPushButton:hover { border-color:#555; color:#fff; }")
+        fs_exit_btn.clicked.connect(self._toggle_fullscreen)
+        fs_toolbar_container.addWidget(fs_exit_btn)
+
+        fs_root.addWidget(fs_toolbar_widget)
+
+        # Three video columns — feeds get more width than Pi Camera
+        fs_feeds = QHBoxLayout()
+        fs_feeds.setContentsMargins(0, 0, 0, 0)
+        fs_feeds.setSpacing(4)
+
+        self._fs_feed1 = QLabel("Feed 1\nWaiting for stream...")
         self._fs_feed1.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._fs_feed1.setStyleSheet("background:#0a0a0a; color:#444;")
+        self._fs_feed1.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._fs_feed1.setStyleSheet("background:#0a0a0a; color:#444; border-radius:4px;")
 
-        self._fs_feed2 = QLabel("Feed 2\nWaiting...")
+        self._fs_feed2 = QLabel("Feed 2\nWaiting for stream...")
         self._fs_feed2.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._fs_feed2.setStyleSheet("background:#0a0a0a; color:#444;")
+        self._fs_feed2.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._fs_feed2.setStyleSheet("background:#0a0a0a; color:#444; border-radius:4px;")
 
         self._fs_picam = QLabel("Pi Camera\nNo photo yet")
         self._fs_picam.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._fs_picam.setStyleSheet("background:#080808; color:#333;")
+        self._fs_picam.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._fs_picam.setStyleSheet("background:#080808; color:#333; border-radius:4px;")
 
-        fs_layout.addWidget(self._fs_feed1, stretch=1)
-        fs_layout.addWidget(self._fs_feed2, stretch=1)
-        fs_layout.addWidget(self._fs_picam, stretch=1)
+        # UC-684 feeds get stretch=5 each, Pi Camera gets stretch=3
+        # This matches 16:9 video proportions better
+        fs_feeds.addWidget(self._fs_feed1, stretch=5)
+        fs_feeds.addWidget(self._fs_feed2, stretch=5)
+        fs_feeds.addWidget(self._fs_picam, stretch=3)
+
+        fs_root.addLayout(fs_feeds, stretch=1)
 
         self._stack = QStackedWidget()
         self._stack.addWidget(self._normal_widget)   # index 0
         self._stack.addWidget(self._fs_widget)       # index 1
+        self._stack.setCurrentIndex(0)
         root.addWidget(self._stack, stretch=1)
 
         sb = QStatusBar()
@@ -770,29 +842,56 @@ class MainWindow(QMainWindow):
         self._fullscreen = not self._fullscreen
         if self._fullscreen:
             self._stack.setCurrentIndex(1)
+            self._header_widget.hide()
             self.statusBar().hide()
             self.showFullScreen()
             self.btn_fullscreen.setText("⛶  Exit Fullscreen")
+            self._fs_btn_yolo.setChecked(self.btn_yolo.isChecked())
+            self._fs_btn_pre.setChecked(self.btn_preprocess.isChecked())
         else:
             self._stack.setCurrentIndex(0)
+            self._header_widget.show()
             self.statusBar().show()
             self.showNormal()
             self.btn_fullscreen.setText("⛶  Fullscreen")
 
+    def _fs_sync_yolo(self, checked: bool):
+        """Keep fullscreen YOLO button in sync with main button."""
+        self.btn_yolo.setChecked(checked)
+
+    def _fs_sync_preprocess(self, checked: bool):
+        """Keep fullscreen preprocess button in sync with main button."""
+        self.btn_preprocess.setChecked(checked)
+
     def _update_fs_feeds(self):
-        """Update the fullscreen feed labels from the same frame data."""
+        """Update fullscreen feed labels with dewarp, preprocessing, and YOLO overlay."""
         if not self._fullscreen:
             return
 
-        for rtp_source, label in [
-            (self.feed1.rtp_source, self._fs_feed1),
-            (self.feed2.rtp_source, self._fs_feed2),
+        for feed, label in [
+            (self.feed1, self._fs_feed1),
+            (self.feed2, self._fs_feed2),
         ]:
-            if not rtp_source:
+            if not feed.rtp_source:
                 continue
-            frame, _ = rtp_source.get_frame()
+            frame, _ = feed.rtp_source.get_frame()
             if frame is None:
                 continue
+
+            # Apply dewarp if maps are ready
+            if feed._map1 is not None:
+                h0, w0 = frame.shape[:2]
+                if feed._dewarp_size != (w0, h0):
+                    feed._build_dewarp_maps(w0, h0)
+                frame = cv2.remap(frame, feed._map1, feed._map2,
+                                  interpolation=cv2.INTER_LINEAR)
+
+            # Apply YOLO overlay if enabled (preprocessing handled inside worker)
+            if self.yolo and self.yolo.enabled:
+                self.yolo.infer_async(feed.feed_number, frame,
+                                      preprocess=self.preprocessing_enabled)
+                frame = self.yolo.draw(feed.feed_number, frame)
+
             lw, lh = label.width(), label.height()
             h, w   = frame.shape[:2]
             scale  = min(lw / w, lh / h, 1.0)
@@ -814,11 +913,26 @@ class MainWindow(QMainWindow):
         if self.yolo:
             self.yolo.enabled = checked
             self.btn_yolo.setText("🦀  YOLO  ON" if checked else "🦀  YOLO  OFF")
+            self._fs_btn_yolo.blockSignals(True)
+            self._fs_btn_yolo.setChecked(checked)
+            self._fs_btn_yolo.setText("🦀  YOLO  ON" if checked else "🦀  YOLO  OFF")
+            self._fs_btn_yolo.blockSignals(False)
 
     def _toggle_preprocess(self, checked: bool):
         self.preprocessing_enabled = checked
         self.btn_preprocess.setText(
             "🌊  Preprocess  ON" if checked else "🌊  Preprocess  OFF")
+        self._fs_btn_pre.blockSignals(True)
+        self._fs_btn_pre.setChecked(checked)
+        self._fs_btn_pre.setText(
+            "🌊  Preprocess  ON" if checked else "🌊  Preprocess  OFF")
+        self._fs_btn_pre.blockSignals(False)
+
+    def _fs_sync_yolo(self, checked: bool):
+        self.btn_yolo.setChecked(checked)
+
+    def _fs_sync_preprocess(self, checked: bool):
+        self.btn_preprocess.setChecked(checked)
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape and self._fullscreen:
