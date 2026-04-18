@@ -579,7 +579,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("RoboSub Vision")
-        self.resize(1400, 860)
+        self.resize(1920, 1080)
         ts = time.strftime("%Y%m%d_%H%M%S")
         self.output_dir = Path("captured_frames") / f"output_{ts}"
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -628,8 +628,8 @@ class MainWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
-        root.setContentsMargins(8, 8, 8, 8)
-        root.setSpacing(8)
+        root.setContentsMargins(12, 8, 12, 8)
+        root.setSpacing(10)
 
         hdr = QHBoxLayout()
         title = QLabel("RoboSub Vision")
@@ -684,7 +684,7 @@ class MainWindow(QMainWindow):
         divider = QFrame()
         divider.setFrameShape(QFrame.Shape.VLine)
         divider.setStyleSheet("color:#222;")
-        self.photo_panel.setFixedWidth(320)
+        self.photo_panel.setFixedWidth(380)
         normal_layout.addWidget(self.feed1, stretch=1)
         normal_layout.addWidget(self.feed2, stretch=1)
         normal_layout.addWidget(divider)
