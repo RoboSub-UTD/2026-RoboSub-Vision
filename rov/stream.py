@@ -1,9 +1,49 @@
 import io
+import json
 import socket
 import subprocess
 import threading
 import time
 from argparse import ArgumentParser
+from pathlib import Path
+
+CONFIG_FILE = Path(__file__).parent / "config.json"
+
+
+def autodetect_topside_ip() -> str:
+    """
+    Resolve topside IP in order of priority:
+      1. config.json next to stream.py  (set this before a dive)
+      2. Default gateway from routing table
+      3. Hardcoded fallback 192.168.2.1
+    """
+    # 1. Config file
+    if CONFIG_FILE.exists():
+        try:
+            cfg = json.loads(CONFIG_FILE.read_text())
+            ip  = cfg.get("topside_ip", "").strip()
+            if ip:
+                print(f"[stream] topside IP from config.json: {ip}")
+                return ip
+        except Exception as exc:
+            print(f"[stream] could not read config.json: {exc}")
+
+    # 2. Default gateway
+    try:
+        result = subprocess.run(
+            ["ip", "route", "show", "default"],
+            capture_output=True, text=True)
+        for line in result.stdout.splitlines():
+            if "default via" in line:
+                gateway = line.split()[2]
+                print(f"[stream] topside IP from gateway: {gateway}")
+                return gateway
+    except Exception:
+        pass
+
+    # 3. Fallback
+    print("[stream] using fallback topside IP: 192.168.2.1")
+    return "192.168.2.1"
 
 try:
     from picamera2 import Picamera2
@@ -15,11 +55,12 @@ except ImportError:
 # ── CLI args ──────────────────────────────────────────────────────────────────
 
 parser = ArgumentParser()
-parser.add_argument("host_ip", help="IP address of the topside computer")
+parser.add_argument("host_ip", nargs="?", default=None,
+                    help="IP address of the topside computer (autodetected if omitted)")
 parser.add_argument("--photo-port", type=int, default=5002,
                     help="TCP port for the Pi Camera photo server (default: 5002)")
 args = parser.parse_args()
-host_ip    = args.host_ip
+host_ip    = args.host_ip or autodetect_topside_ip()
 photo_port = args.photo_port
 
 # ── UC-684 GStreamer streaming ────────────────────────────────────────────────
