@@ -1,0 +1,7 @@
+# RoboSub Vision — ROV (Raspberry Pi) requirements
+# Install with: sudo pip3 install -r requirements.txt --break-system-packages
+#
+# picamera2 is pre-installed on Raspberry Pi OS — do not pip install it.
+# GStreamer is installed via apt — see README.md for apt dependencies.
+
+opencv-python-headless>=4.10.0
