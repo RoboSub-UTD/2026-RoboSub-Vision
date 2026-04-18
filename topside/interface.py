@@ -579,7 +579,28 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("RoboSub Vision")
-        self.resize(1920, 1080)
+
+        # Detect screen size and adapt window
+        screen = QApplication.primaryScreen().availableGeometry()
+        sw, sh = screen.width(), screen.height()
+
+        # Target 90% of screen, capped at 1920x1080, maintaining 16:9
+        target_w = min(int(sw * 0.92), 1920)
+        target_h = min(int(sh * 0.92), 1080)
+        # Enforce 16:9
+        if target_w / target_h > 16 / 9:
+            target_w = int(target_h * 16 / 9)
+        else:
+            target_h = int(target_w * 9 / 16)
+
+        self.resize(target_w, target_h)
+        # Center on screen
+        self.move(
+            screen.x() + (sw - target_w) // 2,
+            screen.y() + (sh - target_h) // 2,
+        )
+        self._screen_w = target_w
+        self._screen_h = target_h
         ts = time.strftime("%Y%m%d_%H%M%S")
         self.output_dir = Path("captured_frames") / f"output_{ts}"
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -633,7 +654,8 @@ class MainWindow(QMainWindow):
 
         hdr = QHBoxLayout()
         title = QLabel("RoboSub Vision")
-        title.setFont(QFont("Courier New", 14, QFont.Weight.Bold))
+        font_size = max(11, int(self._screen_w / 130))
+        title.setFont(QFont("Courier New", font_size, QFont.Weight.Bold))
         title.setStyleSheet("color:#00bfff; letter-spacing:2px;")
         hdr.addWidget(title)
         hdr.addStretch()
@@ -684,7 +706,7 @@ class MainWindow(QMainWindow):
         divider = QFrame()
         divider.setFrameShape(QFrame.Shape.VLine)
         divider.setStyleSheet("color:#222;")
-        self.photo_panel.setFixedWidth(380)
+        self.photo_panel.setFixedWidth(max(300, int(self._screen_w * 0.20)))
         normal_layout.addWidget(self.feed1, stretch=1)
         normal_layout.addWidget(self.feed2, stretch=1)
         normal_layout.addWidget(divider)
