@@ -73,7 +73,7 @@ def make_gst_process(cam_index: int, w: int, h: int, port: int) -> subprocess.Po
         "jpegdec", "!",
         "videoconvert", "!",
         "x264enc", "tune=zerolatency", "speed-preset=ultrafast",
-        "bitrate=12000", "key-int-max=15", "!",
+        "bitrate=12000", "key-int-max=5", "!",
         "rtph264pay", "config-interval=-1", "pt=96", "!",
         "udpsink", f"host={host_ip}", f"port={port}",
     ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
