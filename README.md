@@ -1,4 +1,4 @@
-# RoboSub Vision — 2026 Hydromeda Camera Feed
+# RoboSub Vision - 2026 Hydromeda Camera Feed
 
 Live dual-camera streaming from the ROV with YOLO-based crab detection for the 2026 MATE ROV Competition.
 
@@ -23,7 +23,7 @@ sudo apt install gstreamer1.0-tools gstreamer1.0-plugins-good \
 sudo pip3 install -r rov/requirements.txt --break-system-packages
 ```
 
-`picamera2` is pre-installed on Raspberry Pi OS — no additional install needed.
+`picamera2` is pre-installed on Raspberry Pi OS - no additional install needed.
 
 ### Running
 
@@ -63,7 +63,7 @@ python -m venv .venv
 
 ### Firewall
 
-Open required ports before running — **this is required even if UFW reports inactive:**
+Open required ports before running - **this is required even if UFW reports inactive:**
 
 ```bash
 sudo ufw allow 5000/udp   # UC-684 camera 1
@@ -75,7 +75,7 @@ The install script handles this automatically if UFW is active.
 
 ---
 
-### Linux — Ubuntu / Debian
+### Linux - Ubuntu / Debian
 
 ```bash
 sudo apt install \
@@ -93,7 +93,7 @@ Or use the install script:
 bash topside/install_script.sh
 ```
 
-### Linux — Arch
+### Linux - Arch
 
 ```bash
 sudo pacman -S gstreamer gst-plugins-good gst-plugins-bad \
@@ -119,7 +119,7 @@ pip install -r topside/requirements.txt
 
 ### Windows
 
-Not recommended — PyGObject cannot be pip-installed on Windows. If required:
+Not recommended - PyGObject cannot be pip-installed on Windows. If required:
 
 1. Install [GStreamer](https://gstreamer.freedesktop.org/download/) (MSVC 64-bit runtime + development)
 2. Add `C:\gstreamer\1.0\msvc_x86_64\bin` to your system PATH
@@ -145,7 +145,7 @@ python interface.py
 
 ## YOLO Crab Detection
 
-Detects European Green Crabs for MATE 2026 Task 2.1 (Mitigate Invasive Species). Only Green Crabs receive bounding boxes and are counted — Rock and Jonah crabs are intentionally excluded per competition rules.
+Detects European Green Crabs for MATE 2026 Task 2.1 (Mitigate Invasive Species). Only Green Crabs receive bounding boxes and are counted - Rock and Jonah crabs are intentionally excluded per competition rules.
 
 To retrain the model:
 
