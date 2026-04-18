@@ -31,7 +31,7 @@ from PySide6.QtGui     import (QImage, QPixmap, QFont, QColor,
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton,
     QLineEdit, QHBoxLayout, QVBoxLayout, QGroupBox, QMessageBox,
-    QStatusBar, QSizePolicy, QFrame,
+    QStatusBar, QSizePolicy, QFrame, QStackedWidget,
 )
 
 try:
@@ -82,7 +82,7 @@ CRAB_COLORS = {
 DEFAULT_COLOR = (200, 200, 200)
 
 class YOLOEngine:
-    """crab.pt
+    """
     Runs YOLO26 inference in a single persistent worker thread.
     Uses a queue so frames are dropped if inference can't keep up,
     preventing RAM from climbing.
@@ -585,6 +585,7 @@ class MainWindow(QMainWindow):
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self._joystick          = None
         self.preprocessing_enabled = False
+        self._fullscreen        = False
         model_path = Path(__file__).parent / "crab.pt"
         self.yolo = YOLOEngine(str(model_path)) if YOLO_OK else None
         self._apply_dark_theme()
@@ -660,23 +661,61 @@ class MainWindow(QMainWindow):
             "QPushButton:hover { border-color:#555; }")
         self.btn_preprocess.toggled.connect(self._toggle_preprocess)
         hdr.addWidget(self.btn_preprocess)
+
+        self.btn_fullscreen = QPushButton("⛶  Fullscreen")
+        self.btn_fullscreen.setStyleSheet(
+            "QPushButton { background:#1e1e1e; color:#ccc; border:1px solid #333;"
+            "border-radius:4px; padding:4px 12px; font-size:12px; }"
+            "QPushButton:hover { border-color:#555; color:#fff; }")
+        self.btn_fullscreen.clicked.connect(self._toggle_fullscreen)
+        hdr.addWidget(self.btn_fullscreen)
         hdr.addWidget(_button("Exit", self.close))
         root.addLayout(hdr)
 
-        content = QHBoxLayout()
-        content.setSpacing(8)
         self.feed1 = FeedPanel(1, 5000, self.output_dir, yolo_engine=self.yolo, main_window=self)
         self.feed2 = FeedPanel(2, 5001, self.output_dir, yolo_engine=self.yolo, main_window=self)
+        self.photo_panel = PhotoPanel(self.output_dir)
+
+        # Normal view - side by side with photo panel
+        self._normal_widget = QWidget()
+        normal_layout = QHBoxLayout(self._normal_widget)
+        normal_layout.setContentsMargins(0, 0, 0, 0)
+        normal_layout.setSpacing(8)
         divider = QFrame()
         divider.setFrameShape(QFrame.Shape.VLine)
         divider.setStyleSheet("color:#222;")
-        self.photo_panel = PhotoPanel(self.output_dir)
         self.photo_panel.setFixedWidth(320)
-        content.addWidget(self.feed1, stretch=1)
-        content.addWidget(self.feed2, stretch=1)
-        content.addWidget(divider)
-        content.addWidget(self.photo_panel)
-        root.addLayout(content, stretch=1)
+        normal_layout.addWidget(self.feed1, stretch=1)
+        normal_layout.addWidget(self.feed2, stretch=1)
+        normal_layout.addWidget(divider)
+        normal_layout.addWidget(self.photo_panel)
+
+        # Fullscreen view - three equal columns, no controls
+        self._fs_widget = QWidget()
+        fs_layout = QHBoxLayout(self._fs_widget)
+        fs_layout.setContentsMargins(0, 0, 0, 0)
+        fs_layout.setSpacing(4)
+
+        self._fs_feed1 = QLabel("Feed 1\nWaiting...")
+        self._fs_feed1.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._fs_feed1.setStyleSheet("background:#0a0a0a; color:#444;")
+
+        self._fs_feed2 = QLabel("Feed 2\nWaiting...")
+        self._fs_feed2.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._fs_feed2.setStyleSheet("background:#0a0a0a; color:#444;")
+
+        self._fs_picam = QLabel("Pi Camera\nNo photo yet")
+        self._fs_picam.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._fs_picam.setStyleSheet("background:#080808; color:#333;")
+
+        fs_layout.addWidget(self._fs_feed1, stretch=1)
+        fs_layout.addWidget(self._fs_feed2, stretch=1)
+        fs_layout.addWidget(self._fs_picam, stretch=1)
+
+        self._stack = QStackedWidget()
+        self._stack.addWidget(self._normal_widget)   # index 0
+        self._stack.addWidget(self._fs_widget)       # index 1
+        root.addWidget(self._stack, stretch=1)
 
         sb = QStatusBar()
         sb.setStyleSheet("color:#444; font-size:11px;")
@@ -686,6 +725,7 @@ class MainWindow(QMainWindow):
     def _tick_display(self):
         self.feed1.update_display()
         self.feed2.update_display()
+        self._update_fs_feeds()
 
     def _tick_controller(self):
         if not PYGAME_OK:
@@ -704,6 +744,50 @@ class MainWindow(QMainWindow):
                 if event.button == CAPTURE_BUTTON:
                     self.photo_panel.trigger_capture()
 
+    def _toggle_fullscreen(self):
+        self._fullscreen = not self._fullscreen
+        if self._fullscreen:
+            self._stack.setCurrentIndex(1)
+            self.statusBar().hide()
+            self.showFullScreen()
+            self.btn_fullscreen.setText("⛶  Exit Fullscreen")
+        else:
+            self._stack.setCurrentIndex(0)
+            self.statusBar().show()
+            self.showNormal()
+            self.btn_fullscreen.setText("⛶  Fullscreen")
+
+    def _update_fs_feeds(self):
+        """Update the fullscreen feed labels from the same frame data."""
+        if not self._fullscreen:
+            return
+
+        for rtp_source, label in [
+            (self.feed1.rtp_source, self._fs_feed1),
+            (self.feed2.rtp_source, self._fs_feed2),
+        ]:
+            if not rtp_source:
+                continue
+            frame, _ = rtp_source.get_frame()
+            if frame is None:
+                continue
+            lw, lh = label.width(), label.height()
+            h, w   = frame.shape[:2]
+            scale  = min(lw / w, lh / h, 1.0)
+            dw, dh = max(1, int(w * scale)), max(1, int(h * scale))
+            frame  = cv2.resize(frame, (dw, dh), interpolation=cv2.INTER_LINEAR)
+            h2, w2, _ = frame.shape
+            qt_img = QImage(frame.data, w2, h2, 3 * w2, QImage.Format.Format_BGR888)
+            label.setPixmap(QPixmap.fromImage(qt_img))
+
+        # Pi Camera last photo
+        if self.photo_panel._last_pixmap:
+            scaled = self.photo_panel._last_pixmap.scaled(
+                self._fs_picam.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation)
+            self._fs_picam.setPixmap(scaled)
+
     def _toggle_yolo(self, checked: bool):
         if self.yolo:
             self.yolo.enabled = checked
@@ -713,6 +797,11 @@ class MainWindow(QMainWindow):
         self.preprocessing_enabled = checked
         self.btn_preprocess.setText(
             "🌊  Preprocess  ON" if checked else "🌊  Preprocess  OFF")
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape and self._fullscreen:
+            self._toggle_fullscreen()
+        super().keyPressEvent(event)
 
     def closeEvent(self, event):
         self.display_timer.stop()
