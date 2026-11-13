@@ -1,3 +1,3 @@
-numpy~=2.2.5
-opencv-python~=4.11.0.86
-
+# ROV vision (Raspberry Pi 5 / CM5) has no pip dependencies.
+# stream.py uses only the Python standard library and calls the system GStreamer (gst-launch-1.0).
+# Install GStreamer and the H.264 encoder with: ./install_script.sh

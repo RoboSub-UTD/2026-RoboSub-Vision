@@ -1,4 +1,5 @@
-numpy~=1.26.4
-opencv-python~=4.10.0.84
-pillow~=11.0.0
-PyGObject~=3.52.3
+numpy>=1.26.4
+opencv-python-headless>=4.10.0  # headless: PySide6 provides the GUI; full opencv-python bundles a conflicting Qt
+PySide6>=6.7.0
+PyGObject>=3.52.3
+ultralytics>=8.4.0

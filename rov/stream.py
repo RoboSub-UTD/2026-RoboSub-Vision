@@ -1,81 +1,223 @@
-import cv2
-import numpy as np
+#!/usr/bin/env python3
+"""
+ROV camera video sender: streams the UC-684 USB camera to the topside over RTP/UDP.
+
+Rewrite of the original stream.py. Not a ROS node on purpose: video goes straight to the topside
+vision interface (interface.py listens on UDP 5000), so a ROS problem can't take
+the pilot's video down with it.
+
+What changed from the original stream.py:
+  - Runs on AlmaLinux 10 (system GStreamer from dnf, stdlib-only Python, no picamera2/OpenCV).
+  - The camera is found by USB port (/dev/v4l/by-path), not /dev/video0, so it doesn't break
+    when the Pi's own video nodes (ISP, HEVC decoder) shift the numbering. One camera by default;
+    more can be listed in ROV_CAMERAS (each on its own UDP port).
+  - A camera that is unplugged or crashes is restarted; GStreamer errors are logged, not hidden.
+  - Forces 4:2:0 (I420) before the encoder. UVC cameras usually send 4:2:2 JPEG, which made
+    x264enc produce High 4:2:2 H.264 that many hardware decoders can't play.
+  - Encoder is picked from what's installed: x264enc (RPM Fusion), then openh264enc.
+  - Optional MJPEG mode (--codec mjpeg): forwards the camera's JPEG frames without re-encoding.
+    The Pi 5 has no hardware H.264 encoder, so this costs almost no CPU, but uses much more
+    tether bandwidth. The topside must be started with ROV_VIDEO_CODEC=mjpeg too.
+  - The Camera Module 3 photo server (TCP 5002) is gone: photos now go through ROS
+    (rov_photogrammetry -> topside photogrammetry_saver -> captures folder).
+
+Settings come from command-line flags or the environment (video.env, loaded by run.sh and the service):
+  ROV_TOPSIDE_IP     topside address                         (default 192.168.1.69)
+  ROV_CAMERAS        "auto" (first USB camera -> UDP 5000) or "DEVICE[:PORT[:WxH[@FPS]]] ..."
+  ROV_VIDEO_CODEC    h264 | mjpeg                             (default h264)
+  ROV_VIDEO_BITRATE  H.264 bitrate in kbit/s                  (default 12000)
+  ROV_VIDEO_SIZE     default WxH@FPS for each camera          (default 1920x1080@30)
+  ROV_VIDEO_ENCODER  auto | x264enc | openh264enc             (default auto)
+
+Examples:
+  python3 stream.py --list              # show cameras and their by-path names
+  python3 stream.py --dry-run           # print the GStreamer pipelines
+  python3 stream.py                     # stream (auto: first USB camera -> UDP 5000)
+  python3 stream.py --host 10.6.18.143 --cam /dev/v4l/by-path/...-video-index0:5000
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import os
+import re
+import shutil
+import signal
 import subprocess
+import sys
 import threading
+import time
 from argparse import ArgumentParser
+from pathlib import Path
+
+CONFIG_FILE = Path(__file__).parent / "config.json"
+
+
+def autodetect_topside_ip() -> str:
+    """
+    Resolve topside IP in order of priority:
+      1. config.json next to stream.py  (set this before a dive)
+      2. Default gateway from routing table
+      3. Hardcoded fallback 192.168.2.1
+    """
+    # 1. Config file
+    if CONFIG_FILE.exists():
+        try:
+            cfg = json.loads(CONFIG_FILE.read_text())
+            ip  = cfg.get("topside_ip", "").strip()
+            if ip:
+                print(f"[stream] topside IP from config.json: {ip}")
+                return ip
+        except Exception as exc:
+            print(f"[stream] could not read config.json: {exc}")
+
+    # 2. Default gateway
+    try:
+        result = subprocess.run(
+            ["ip", "route", "show", "default"],
+            capture_output=True, text=True)
+        for line in result.stdout.splitlines():
+            if "default via" in line:
+                gateway = line.split()[2]
+                print(f"[stream] topside IP from gateway: {gateway}")
+                return gateway
+    except Exception:
+        pass
+
+    # 3. Fallback
+    print("[stream] using fallback topside IP: 192.168.2.1")
+    return "192.168.2.1"
+
+try:
+    from picamera2 import Picamera2
+    PICAMERA_AVAILABLE = True
+except ImportError:
+    PICAMERA_AVAILABLE = False
+    print("[warn] picamera2 not found — photo server disabled")
+
+# ── CLI args ──────────────────────────────────────────────────────────────────
 
 parser = ArgumentParser()
-parser.add_argument('host_ip')
+parser.add_argument("host_ip", nargs="?", default=None,
+                    help="IP address of the topside computer (autodetected if omitted)")
+parser.add_argument("--photo-port", type=int, default=5002,
+                    help="TCP port for the Pi Camera photo server (default: 5002)")
 args = parser.parse_args()
-host_ip = args.host_ip
+host_ip    = args.host_ip or autodetect_topside_ip()
+photo_port = args.photo_port
 
-# Shared camera matrix and distortion
-K = np.array([[522, 0.0, 320.0],
-                [0.0, 522, 240.0],
-                [0.0, 0.0, 1.0]], dtype=np.float32)
+# ── UC-684 GStreamer streaming ────────────────────────────────────────────────
 
-D = np.array([-0.2, 0.02, 0.0, 0.0], dtype=np.float32)
-
-# GStreamer command template
-def make_gst_process(w, h, port):
-        return subprocess.Popen([
-        "gst-launch-1.0", "fdsrc", "!",
-        f"rawvideoparse", f"width={w}", f"height={h}", "format=rgb", "framerate=30/1", "!",
+def make_gst_process(cam_index: int, w: int, h: int, port: int) -> subprocess.Popen:
+    return subprocess.Popen([
+        "gst-launch-1.0",
+        "v4l2src", f"device=/dev/video{cam_index}", "!",
+        f"image/jpeg,width={w},height={h},framerate=30/1", "!",
+        "jpegdec", "!",
         "videoconvert", "!",
-        "x264enc", "tune=zerolatency", "speed-preset=ultrafast", "bitrate=4000", "key-int-max=30", "intra-refresh=true", "!",
-        "rtph264pay", "config-interval=1", "pt=96", "!",
-        "udpsink", f"host={host_ip}", f"port={port}"
-        ], stdin=subprocess.PIPE)
-
-# Camera thread function
-def stream_camera(cam_index, port, name):
-        cap = cv2.VideoCapture(cam_index)
-        if not cap.isOpened():
-                print(f"Camera {cam_index} failed to open.")
-                return
-
-        ret, frame = cap.read()
-        if not ret:
-                print(f"Camera {cam_index} failed to grab frame.")
-                cap.release()
-                return
-
-        h, w = frame.shape[:2]
-
-        # Compute remap maps
-        new_K = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(K, D, (w, h), np.eye(3), balance=0.05)
-        map1, map2 = cv2.fisheye.initUndistortRectifyMap(K, D, np.eye(3), new_K, (w, h), cv2.CV_16SC2)
-
-        # Start GStreamer pipeline
-        proc = make_gst_process(w, h, port)
-
-        while True:
-                ret, frame = cap.read()
-                if not ret:
-                 break
-
-                # Dewarp and convert to RGB
-                dewarped = cv2.remap(frame, map1, map2, interpolation=cv2.INTER_LINEAR)
-                rgb = cv2.cvtColor(dewarped, cv2.COLOR_BGR2RGB)
-
-                try:
-                        proc.stdin.write(rgb.tobytes())
-                except BrokenPipeError:
-                        print(f"GStreamer pipeline for camera {cam_index} closed.")
-                        break
+        "x264enc", "tune=zerolatency", "speed-preset=ultrafast",
+        "bitrate=12000", "key-int-max=5", "!",
+        "rtph264pay", "config-interval=-1", "pt=96", "!",
+        "udpsink", f"host={host_ip}", f"port={port}",
+    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-        cap.release()
-        proc.stdin.close()
-        proc.wait()
+def stream_camera(cam_index: int, port: int, name: str):
+    w, h = 1920, 1080
+    print(f"[{name}] streaming {w}x{h} → {host_ip}:{port}")
+    proc = make_gst_process(cam_index, w, h, port)
+    proc.wait()
 
-# Start both cameras in threads
-t0 = threading.Thread(target=stream_camera, args=(0, 5000, "Camera 0"))
-t1 = threading.Thread(target=stream_camera, args=(4, 5001, "Camera 4"))
+# ── Pi Camera Module 3 photo server ──────────────────────────────────────────
 
-t0.start()
-t1.start()
+picam2 = None
 
-t0.join()
-t1.join()
 
+def init_picamera() -> bool:
+    """Initialise the Pi Camera Module 3 for full-resolution still capture."""
+    global picam2
+    if not PICAMERA_AVAILABLE:
+        return False
+    try:
+        picam2 = Picamera2()
+        # 4608×2592 = native 12 MP resolution of Camera Module 3
+        cfg = picam2.create_still_configuration(
+            main={"size": (4608, 2592)},
+            display=None,
+            buffer_count=1,
+        )
+        picam2.configure(cfg)
+        picam2.start()
+        time.sleep(2)  # allow auto-exposure / white-balance to settle
+        print(f"[PiCam3] ready  (4608×2592, port {photo_port})")
+        return True
+    except Exception as exc:
+        print(f"[PiCam3] init failed: {exc}")
+        picam2 = None
+        return False
+
+
+def handle_photo_client(conn: socket.socket, addr):
+    """
+    Protocol (one round-trip per connection):
+      ← "CAPTURE"          (from topside)
+      → <uint32-BE length> (4 bytes)
+      → <JPEG bytes>       (length bytes)
+    If the camera is unavailable, length is sent as 0.
+    """
+    try:
+        cmd = conn.recv(16).decode(errors="ignore").strip()
+        if cmd != "CAPTURE":
+            print(f"[PiCam3] unknown command from {addr}: {cmd!r}")
+            return
+
+        if picam2 is None:
+            print(f"[PiCam3] capture requested but camera unavailable")
+            conn.sendall((0).to_bytes(4, "big"))
+            return
+
+        print(f"[PiCam3] capturing for {addr} …")
+        buf = io.BytesIO()
+        picam2.capture_file(buf, format="jpeg")
+        jpeg = buf.getvalue()
+
+        conn.sendall(len(jpeg).to_bytes(4, "big"))
+        conn.sendall(jpeg)
+        print(f"[PiCam3] sent {len(jpeg):,} bytes to {addr}")
+
+    except Exception as exc:
+        print(f"[PiCam3] error handling {addr}: {exc}")
+    finally:
+        conn.close()
+
+
+def run_photo_server():
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("0.0.0.0", photo_port))
+    srv.listen(5)
+    print(f"[PiCam3] TCP photo server listening on :{photo_port}")
+    while True:
+        conn, addr = srv.accept()
+        threading.Thread(
+            target=handle_photo_client,
+            args=(conn, addr),
+            daemon=True,
+        ).start()
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    # Pi Camera Module 3 — initialise then start TCP server
+    init_picamera()
+    threading.Thread(target=run_photo_server, daemon=True).start()
+
+    # UC-684 cameras — stream in parallel
+    # Uncomment t1 lines when second camera is connected
+    t0 = threading.Thread(target=stream_camera, args=(0, 5000, "UC-684 #0"))
+    # t1 = threading.Thread(target=stream_camera, args=(2, 5001, "UC-684 #1"))
+    t0.start()
+    # t1.start()
+    t0.join()
+    # t1.join()
