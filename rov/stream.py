@@ -39,6 +39,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import fcntl
 import glob
 import os
 import re
@@ -52,6 +53,9 @@ from dataclasses import dataclass
 
 FIRST_PORT = 5000
 RESTART_DELAY_S = 2.0
+MAX_RESTART_DELAY_S = 30.0
+QUICK_FAIL_S = 5.0          # a run shorter than this counts as a failed start
+LOCK_FILE = "/tmp/rov-video.lock"
 _SIZE_RE = re.compile(r"^(\d+)x(\d+)(?:@(\d+))?$")
 
 
@@ -170,6 +174,8 @@ class CameraStreamer(threading.Thread):
 
     def run(self) -> None:
         waiting_logged = False
+        delay = RESTART_DELAY_S
+        last_error = None
         while not self.stop.is_set():
             if not os.path.exists(self.cam.device):
                 if not waiting_logged:
@@ -178,19 +184,52 @@ class CameraStreamer(threading.Thread):
                 self.stop.wait(RESTART_DELAY_S)
                 continue
             waiting_logged = False
-            log(f"[{self.cam.label}] {self.cam.width}x{self.cam.height}@{self.cam.fps} "
-                f"{os.path.basename(self.cam.device)} -> udp:{self.cam.port}")
+            quiet = last_error is not None   # same failure again: don't repeat the whole GStreamer dump
+            if not quiet:
+                log(f"[{self.cam.label}] {self.cam.width}x{self.cam.height}@{self.cam.fps} "
+                    f"{os.path.basename(self.cam.device)} -> udp:{self.cam.port}")
+            started = time.monotonic()
             self.proc = subprocess.Popen(self.argv, stdout=subprocess.PIPE,
                                          stderr=subprocess.STDOUT, text=True, bufsize=1)
             assert self.proc.stdout is not None
+            first_error, held = None, []
             for line in self.proc.stdout:
                 line = line.strip()
-                if line and not line.startswith(("Setting pipeline", "Pipeline is", "New clock",
-                                                 "Redistribute latency", "Prerolled")):
-                    log(f"[{self.cam.label}] {line}")
+                if not line or line.startswith(("Setting pipeline", "Pipeline is", "New clock",
+                                                "Redistribute latency", "Prerolled")):
+                    continue
+                if first_error is None and line.startswith("ERROR"):
+                    first_error = line
+                if quiet and time.monotonic() - started < QUICK_FAIL_S:
+                    held.append(line)            # print only if this run turns out to be different
+                    continue
+                if held:
+                    for h in held:
+                        log(f"[{self.cam.label}] {h}")
+                    held = []
+                quiet = False
+                log(f"[{self.cam.label}] {line}")
             code = self.proc.wait()
-            if not self.stop.is_set():
-                log(f"[{self.cam.label}] gst-launch exited ({code}); restarting in {RESTART_DELAY_S:.0f}s")
+            if self.stop.is_set():
+                break
+            ran = time.monotonic() - started
+            if ran < QUICK_FAIL_S:
+                if held and first_error != last_error:
+                    for h in held:
+                        log(f"[{self.cam.label}] {h}")
+                if first_error and "busy" in first_error.lower() and first_error != last_error:
+                    dev = os.path.realpath(self.cam.device)
+                    log(f"[{self.cam.label}] The camera is in use by another program. Find it with: "
+                        f"sudo fuser -v {dev}   (often rov-video.service: sudo systemctl stop rov-video)")
+                last_error = first_error or f"exit {code}"
+                log(f"[{self.cam.label}] failed to start ({first_error or f'exit {code}'}); "
+                    f"retrying in {delay:.0f}s")
+                self.stop.wait(delay)
+                delay = min(delay * 2, MAX_RESTART_DELAY_S)
+            else:
+                log(f"[{self.cam.label}] gst-launch exited ({code}) after {ran:.0f}s; "
+                    f"restarting in {RESTART_DELAY_S:.0f}s")
+                last_error, delay = None, RESTART_DELAY_S
                 self.stop.wait(RESTART_DELAY_S)
 
     def terminate(self) -> None:
@@ -200,6 +239,23 @@ class CameraStreamer(threading.Thread):
                 self.proc.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 self.proc.kill()
+
+
+_lock_handle = None
+
+
+def acquire_lock(path: str = LOCK_FILE):
+    """Only one sender at a time (a manual run and rov-video.service would fight over the camera)."""
+    global _lock_handle
+    try:
+        fh = open(path, "a+")
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return None
+    except OSError:
+        return True   # can't create the lock file: don't block streaming over it
+    _lock_handle = fh
+    return fh
 
 
 def list_cameras() -> int:
@@ -235,6 +291,14 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.list:
         return list_cameras()
+    if not args.dry_run:
+        lock = acquire_lock()
+        if lock is None:
+            log("Another copy of the video sender is already running and holding the camera.")
+            log("If it's the boot service: sudo systemctl stop rov-video   "
+                "(or watch it: journalctl -u rov-video -f)")
+            log("Otherwise find it with: pgrep -af 'stream.py|rov_video_sender'")
+            return 1
     if not shutil.which("gst-launch-1.0") and not args.dry_run:
         log("gst-launch-1.0 not found. Run ./install_script.sh (installs GStreamer).")
         return 1

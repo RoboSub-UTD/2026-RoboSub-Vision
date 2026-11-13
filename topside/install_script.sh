@@ -1,19 +1,13 @@
 #!/bin/bash
 
-# Install script for RTP Camera System
+set -euo pipefail
 
 # RoboSub Vision — topside install script
 # Supports: Ubuntu/Debian, Arch Linux, AlmaLinux/RHEL 10 (and Rocky/Fedora)
 # Requires: Python 3.12 (AlmaLinux 10's system Python; use pyenv elsewhere if yours is newer)
 # Python packages go into ./.venv; run the app with ./run.sh
 
-# Install Python packages
-pip3 install \
-    opencv-python \
-    opencv-python-headless \
-    numpy \
-    Pillow \
-    PyGObject
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ── Privilege check ───────────────────────────────────────────────────────────
 
@@ -203,7 +197,8 @@ echo "Verifying GStreamer Python bindings..."
 "$PY" -c "
 import gi
 gi.require_version('Gst', '1.0')
-from gi.repository import Gst
+gi.require_version('GstApp', '1.0')
+from gi.repository import Gst, GstApp
 Gst.init(None)
 print('GStreamer:', Gst.version_string())
 print('GstApp OK')

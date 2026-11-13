@@ -1,3 +1,7 @@
 __pycache__/
 .DS_Store
 captured_frames/
+venv/
+.venv/
+env/
+ENV/

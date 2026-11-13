@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 3
+names: ['European Green crab', 'Native Jonah crab', 'Native Rock crab']
+
+roboflow:
+  workspace: vikneshs-workspace
+  project: crab-j7ofs-wnmkr
+  version: 2
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/vikneshs-workspace/crab-j7ofs-wnmkr/dataset/2

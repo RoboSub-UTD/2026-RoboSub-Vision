@@ -12,12 +12,14 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from PIL import Image, ImageTk
-import os
-import time
-import threading
+
+try:
+    from ultralytics import YOLO as _YOLO
+    YOLO_OK = True
+except ImportError:
+    YOLO_OK = False
+    print("[warn] ultralytics not installed — YOLO inference disabled")
 import gi
-from pathlib import Path
 
 gi.require_version("Gst", "1.0")
 gi.require_version("GstApp", "1.0")
@@ -33,7 +35,6 @@ from PySide6.QtWidgets import (
 )
 
 
-# Initialize GStreamer
 Gst.init(None)
 
 
@@ -212,47 +213,19 @@ class YOLOEngine:
 # ── GStreamer RTP source ───────────────────────────────────────────────────────
 
 class GstreamerRTPSource:
-    """Class to handle GStreamer RTP video source"""
+
     def __init__(self, port=5000):
-        self.port = port
-        self.frame = None
-        self.lock = threading.Lock()
-        self.running = False
-        self.pipeline = None
-        self.loop = None
-        self.loop_thread = None
-        
-    def on_new_sample(self, sink):
-        """Callback for new video samples"""
-        sample = sink.emit("pull-sample")
-        if not sample:
-            return Gst.FlowReturn.ERROR
-            
-        buf = sample.get_buffer()
-        caps = sample.get_caps()
-        
-        structure = caps.get_structure(0)
-        width = structure.get_value("width")
-        height = structure.get_value("height")
-        
-        success, map_info = buf.map(Gst.MapFlags.READ)
-        if not success:
-            return Gst.FlowReturn.ERROR
-            
-        # Create a copy of the numpy array to avoid issues when buffer is unmapped
-        # Reshape based on frame dimensions
-        new_frame = np.frombuffer(map_info.data, dtype=np.uint8).reshape((height, width, 3)).copy()
-        
-        # Update the current frame thread-safely
-        with self.lock:
-            self.frame = new_frame
-            
-        # Unmap buffer
-        buf.unmap(map_info)
-        return Gst.FlowReturn.OK
-    
+        self.port         = port
+        self.frame        = None
+        self.frame_time   = None   # monotonic time when frame arrived
+        self.lock         = threading.Lock()
+        self.running      = False
+        self.pipeline     = None
+        self._loop        = None
+        self._loop_thread = None
+        self._sink        = None
+
     def start(self):
-        """Start the GStreamer pipeline"""
         if self.running:
             return
         if VIDEO_CODEC == "mjpeg":
@@ -269,49 +242,54 @@ class GstreamerRTPSource:
             f"video/x-raw,format=BGR ! "
             f"appsink name=sink emit-signals=false max-buffers=1 drop=true sync=false"
         )
-        
-        self.pipeline = Gst.parse_launch(pipeline_str)
-        appsink = self.pipeline.get_by_name("sink")
-        appsink.connect("new-sample", self.on_new_sample)
-        
-        # Start the pipeline
+        self.pipeline = Gst.parse_launch(pipe_str)
+        self._sink    = self.pipeline.get_by_name("sink")
         self.pipeline.set_state(Gst.State.PLAYING)
-        
-        # Create and start GLib main loop in a separate thread
-        self.loop = GLib.MainLoop()
-        self.loop_thread = threading.Thread(target=self.loop.run)
-        self.loop_thread.daemon = True
-        self.loop_thread.start()
-        
-        self.running = True
-        print(f"GStreamer RTP source started on port {self.port}")
-    
+        self._loop        = GLib.MainLoop()
+        self._loop_thread = threading.Thread(target=self._loop.run, daemon=True)
+        self._loop_thread.start()
+        self.running      = True
+        self._poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
+        self._poll_thread.start()
+        print(f"[GStreamer] port {self.port} started")
+
+    def _poll_loop(self):
+        while self.running:
+            sample = self._sink.try_pull_sample(Gst.SECOND)
+            if sample is None:
+                continue
+            arrived  = time.monotonic()
+            buf      = sample.get_buffer()
+            caps     = sample.get_caps()
+            s        = caps.get_structure(0)
+            w        = s.get_value("width")
+            h        = s.get_value("height")
+            ok, info = buf.map(Gst.MapFlags.READ)
+            if not ok:
+                continue
+            frame = np.frombuffer(info.data, dtype=np.uint8).reshape((h, w, 3)).copy()
+            with self.lock:
+                self.frame      = frame
+                self.frame_time = arrived
+            buf.unmap(info)
+
     def get_frame(self):
-        """Get the current frame thread-safely"""
         with self.lock:
-            if self.frame is not None:
-                return self.frame.copy()
-            return None
-    
+            if self.frame is None:
+                return None, None
+            return self.frame.copy(), self.frame_time
+
     def stop(self):
-        """Stop the GStreamer pipeline"""
         if not self.running:
             return
-            
-        # Quit the GLib main loop
-        if self.loop and self.loop.is_running():
-            self.loop.quit()
-            
-        # Wait for the loop thread to finish
-        if self.loop_thread and self.loop_thread.is_alive():
-            self.loop_thread.join(timeout=1.0)
-            
-        # Stop the pipeline
+        self.running = False
+        if self._loop and self._loop.is_running():
+            self._loop.quit()
+        if self._loop_thread and self._loop_thread.is_alive():
+            self._loop_thread.join(timeout=2.0)
         if self.pipeline:
             self.pipeline.set_state(Gst.State.NULL)
-            
-        self.running = False
-        print(f"GStreamer RTP source stopped on port {self.port}")
+        print(f"[GStreamer] port {self.port} stopped")
 
 # ── UC-684 feed panel ─────────────────────────────────────────────────────────
 
@@ -558,9 +536,10 @@ class PhotoPanel(QWidget):
         self.set_folder(default_captures_dir(saved=self._settings.value("captures_dir", None)),
                         remember=False)
 
-        # Left camera frame (remove LabelFrame border and padding)
-        self.left_cam_frame = ttk.Frame(self.cameras_frame)
-        self.left_cam_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=0, pady=0)
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
 
         header = QLabel("Photogrammetry")
         header.setFont(QFont("Courier New", 11, QFont.Weight.Bold))
@@ -728,54 +707,33 @@ class MainWindow(QMainWindow):
         self._apply_dark_theme()
         self._build_ui()
 
-        # Capture button for Feed 2
-        self.btn_capture2 = ttk.Button(
-            self.capture_frame, 
-            text="Capture Feed 2", 
-            command=lambda: self.capture_frames(2)
-        )
-        self.btn_capture2.pack(side=tk.LEFT, padx=5)
+        self.display_timer = QTimer(self)
+        self.display_timer.timeout.connect(self._tick_display)
+        self.display_timer.start(33)
 
         self.feed1.connect()
 
-        self.last_frame_hash1 = None
-        self.last_frame_hash2 = None
-        
-        self.btn_connect2 = ttk.Button(
-            self.port_frame2,
-            text="Connect",
-            command=lambda: self.connect_to_stream(2)
-        )
-        self.btn_connect2.pack(side=tk.LEFT, padx=5)
-        
-        # View mode frame
-        self.view_frame = ttk.Frame(self.control_frame)
-        self.view_frame.pack(side=tk.TOP, fill=tk.X, pady=5)
-        
-        # Process checkboxes
-        self.process_var1 = tk.BooleanVar(value=False)
-        self.chk_process1 = ttk.Checkbutton(
-            self.view_frame,
-            text="Show Feed 1",
-            variable=self.process_var1
-        )
-        self.chk_process1.pack(side=tk.LEFT, padx=20)
-        
-        self.process_var2 = tk.BooleanVar(value=False)
-        self.chk_process2 = ttk.Checkbutton(
-            self.view_frame,
-            text="Show Feed 2",
-            variable=self.process_var2
-        )
-        self.chk_process2.pack(side=tk.LEFT, padx=20)
-        
-        # Exit button
-        self.btn_exit = ttk.Button(
-            self.view_frame, 
-            text="Exit", 
-            command=self.close_app
-        )
-        self.btn_exit.pack(side=tk.RIGHT, padx=5)
+    def _apply_dark_theme(self):
+        p = QPalette()
+        dark, mid = QColor("#0f0f0f"), QColor("#1a1a1a")
+        text, acc = QColor("#d0d0d0"), QColor("#00bfff")
+        p.setColor(QPalette.ColorRole.Window,          dark)
+        p.setColor(QPalette.ColorRole.WindowText,      text)
+        p.setColor(QPalette.ColorRole.Base,            mid)
+        p.setColor(QPalette.ColorRole.AlternateBase,   dark)
+        p.setColor(QPalette.ColorRole.Text,            text)
+        p.setColor(QPalette.ColorRole.Button,          mid)
+        p.setColor(QPalette.ColorRole.ButtonText,      text)
+        p.setColor(QPalette.ColorRole.Highlight,       acc)
+        p.setColor(QPalette.ColorRole.HighlightedText, QColor("#000"))
+        self.setPalette(p)
+        self.setStyleSheet(
+            "QPushButton { background:#1e1e1e; color:#ccc; border:1px solid #333;"
+            "border-radius:4px; padding:4px 10px; font-size:12px; }"
+            "QPushButton:hover { background:#252525; border-color:#555; color:#fff; }"
+            "QPushButton:pressed { background:#111; }"
+            "QLineEdit { background:#111; color:#ddd; border:1px solid #333;"
+            "border-radius:3px; padding:2px 4px; font-size:12px; }")
 
     def _build_ui(self):
         central = QWidget()
@@ -886,18 +844,8 @@ def _button(text, slot=None):
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # Create Tkinter window
-    root = tk.Tk()
-    root.geometry("1100x900")
-    
-    # Create app
-    app = CameraCaptureApp(root)
-    
-    # Set up window close handler
-    root.protocol("WM_DELETE_WINDOW", app.close_app)
-    
-    print("Entering main loop!")
-    
-    # Start Tkinter event loop
-
-    root.mainloop()
+    app = QApplication(sys.argv)
+    app.setApplicationName("RoboSub Vision")
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())
