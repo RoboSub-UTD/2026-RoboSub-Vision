@@ -83,7 +83,8 @@ elif [[ "${ID:-}" == "almalinux" ]] || [[ "${ID:-}" == "rhel" ]] || [[ "${ID:-}"
         gstreamer1-plugins-base \
         gstreamer1-plugins-good \
         gstreamer1-plugins-bad-free \
-        gstreamer1-plugins-ugly-free
+        gstreamer1-plugins-ugly-free \
+        tcpdump iw   # video_check.py (stream analysis), Wi-Fi power-save control
     # H.264 decoder: gst-libav from RPM Fusion; OpenH264 as a fallback
     $SUDO dnf install -y gstreamer1-libav || \
         $SUDO dnf install -y gstreamer1-plugin-openh264 || \
@@ -189,6 +190,12 @@ if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewa
     $SUDO firewall-cmd --permanent --add-port=5000-5001/udp   # UC-684 cameras 1 and 2 (RTP/H.264)
     $SUDO firewall-cmd --reload
     echo "Ports 5000-5001/udp opened."
+fi
+
+# ── Larger UDP receive buffer (1080p MJPEG video arrives in big bursts) ───────
+if [[ "$(uname)" == "Linux" ]]; then
+    echo "net.core.rmem_max = 8388608" | $SUDO tee /etc/sysctl.d/90-rov-video.conf >/dev/null
+    $SUDO sysctl -q -p /etc/sysctl.d/90-rov-video.conf || true
 fi
 
 # ── Verify GStreamer bindings ─────────────────────────────────────────────────

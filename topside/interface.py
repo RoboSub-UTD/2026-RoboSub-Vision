@@ -229,7 +229,9 @@ class GstreamerRTPSource:
         if self.running:
             return
         if VIDEO_CODEC == "mjpeg":
-            depay = (f"udpsrc port={self.port} "
+            # 1080p MJPEG frames are large bursts of packets; a big socket buffer avoids dropped frames
+            # (needs net.core.rmem_max raised; install_script.sh does that)
+            depay = (f"udpsrc port={self.port} buffer-size=8388608 "
                      f"caps=application/x-rtp,media=video,clock-rate=90000,encoding-name=JPEG,payload=26 ! "
                      f"rtpjpegdepay ! jpegdec ! ")
         else:

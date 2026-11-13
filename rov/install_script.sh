@@ -24,7 +24,8 @@ echo "Host: ${PRETTY_NAME:-unknown} ($(uname -m))"
 
 if command -v dnf >/dev/null 2>&1; then
     # ── AlmaLinux / RHEL ──
-    sudo dnf install -y python3 gstreamer1 gstreamer1-plugins-base gstreamer1-plugins-good v4l-utils
+    sudo dnf install -y python3 gstreamer1 gstreamer1-plugins-base gstreamer1-plugins-good v4l-utils iw
+    sudo dnf install -y gstreamer1-plugins-bad-free || true   # h264parse (camera-h264 mode; optional)
     # x264enc is in gstreamer1-plugins-ugly from RPM Fusion (needs EPEL + CRB); OpenH264 is the fallback
     if ! gst-inspect-1.0 --exists x264enc 2>/dev/null; then
         sudo dnf install -y dnf-plugins-core epel-release || true
@@ -39,7 +40,7 @@ elif command -v apt-get >/dev/null 2>&1; then
     # ── Raspberry Pi OS / Debian ──
     sudo apt-get update
     sudo apt-get install -y python3 gstreamer1.0-tools gstreamer1.0-plugins-base \
-        gstreamer1.0-plugins-good gstreamer1.0-plugins-ugly v4l-utils
+        gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly v4l-utils iw
 else
     echo "Unsupported OS: install GStreamer (good + ugly plugins) and v4l-utils manually."
     exit 1
@@ -53,6 +54,17 @@ else
     echo "WARNING: no H.264 encoder found. Set ROV_VIDEO_CODEC=mjpeg in video.env,"
     echo "         and start the topside interface with ROV_VIDEO_CODEC=mjpeg ./run.sh"
 fi
+
+# Wi-Fi power saving causes periodic video stalls (lag spikes); turn it off for good
+if command -v nmcli >/dev/null 2>&1; then
+    printf "[connection]\\nwifi.powersave = 2\\n" | sudo tee /etc/NetworkManager/conf.d/90-rov-wifi-powersave.conf >/dev/null
+    sudo systemctl reload NetworkManager 2>/dev/null || true
+fi
+for w in /sys/class/net/*/wireless; do
+    [ -e "$w" ] || continue
+    i=$(basename "$(dirname "$w")")
+    sudo iw dev "$i" set power_save off 2>/dev/null && echo "Wi-Fi power saving off on $i"
+done
 
 echo "Adding $USER to the video group (camera access; takes effect after logging out and back in)"
 sudo usermod -aG video "$USER"

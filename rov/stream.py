@@ -15,6 +15,9 @@ What changed from the original stream.py:
   - Forces 4:2:0 (I420) before the encoder. UVC cameras usually send 4:2:2 JPEG, which made
     x264enc produce High 4:2:2 H.264 that many hardware decoders can't play.
   - Encoder is picked from what's installed: x264enc (RPM Fusion), then openh264enc.
+  - camera-h264 mode (--codec camera-h264): for cameras that output H.264 themselves (many
+    Arducam USB cameras, including the UC-684, have a second H.264 video node). The Pi only
+    repackages it, so it costs almost no CPU and needs no x264. The topside needs no change.
   - Optional MJPEG mode (--codec mjpeg): forwards the camera's JPEG frames without re-encoding.
     The Pi 5 has no hardware H.264 encoder, so this costs almost no CPU, but uses much more
     tether bandwidth. The topside must be started with ROV_VIDEO_CODEC=mjpeg too.
@@ -24,10 +27,14 @@ What changed from the original stream.py:
 Settings come from command-line flags or the environment (video.env, loaded by run.sh and the service):
   ROV_TOPSIDE_IP     topside address                         (default 192.168.1.69)
   ROV_CAMERAS        "auto" (first USB camera -> UDP 5000) or "DEVICE[:PORT[:WxH[@FPS]]] ..."
-  ROV_VIDEO_CODEC    h264 | mjpeg                             (default h264)
+  ROV_VIDEO_CODEC    h264 | camera-h264 | mjpeg               (default h264)
   ROV_VIDEO_BITRATE  H.264 bitrate in kbit/s                  (default 12000)
   ROV_VIDEO_SIZE     default WxH@FPS for each camera          (default 1920x1080@30)
   ROV_VIDEO_ENCODER  auto | x264enc | openh264enc             (default auto)
+  ROV_JPEG_QUALITY   mjpeg only: re-compress on the Pi at this quality, 1-100 (default 0 = camera's frames)
+  ROV_CAMERA_CONTROLS  v4l2 controls applied each time the camera starts (they reset on replug/reboot)
+                     (default exposure_dynamic_framerate=0,power_line_frequency=2: steady 30 fps in dim
+                     water, no 60 Hz flicker under US lights; empty = leave the camera alone)
 
 Examples:
   python3 stream.py --list              # show cameras and their by-path names
@@ -60,7 +67,10 @@ _SIZE_RE = re.compile(r"^(\d+)x(\d+)(?:@(\d+))?$")
 
 
 def log(msg: str) -> None:
-    print(time.strftime("%H:%M:%S"), msg, flush=True)
+    try:
+        print(time.strftime("%H:%M:%S"), msg, flush=True)
+    except (BrokenPipeError, ValueError):   # stdout closed (e.g. piped into head); keep streaming
+        pass
 
 
 # --------------------------------------------------------------------- cameras
@@ -84,18 +94,59 @@ def parse_size(text: str) -> tuple[int, int, int | None]:
     return int(m.group(1)), int(m.group(2)), int(m.group(3)) if m.group(3) else None
 
 
+CODECS = ("h264", "camera-h264", "mjpeg")
+_FOURCC_RE = re.compile(r"\[\d+\]:\s*'(\w{3,4})\s*'")
+
+
 def usb_camera_paths(by_path_dir: str = "/dev/v4l/by-path") -> list[str]:
-    """USB capture nodes in a stable order (by USB port). Skips the Pi's built-in video nodes and
-    the metadata nodes (index1) that every UVC camera also creates."""
+    """First video node of each USB camera, in a stable order (by USB port). Skips the Pi's
+    built-in video nodes (ISP, HEVC decoder)."""
     return sorted(glob.glob(os.path.join(by_path_dir, "*usb*-video-index0")))
 
 
-def parse_cameras(spec: str, default_size: str, by_path_dir: str = "/dev/v4l/by-path") -> list[Camera]:
+def usb_video_nodes(by_path_dir: str = "/dev/v4l/by-path") -> list[str]:
+    """Every USB video node (a camera can have several: MJPEG, H.264, metadata)."""
+    return sorted(glob.glob(os.path.join(by_path_dir, "*usb*-video-index*")))
+
+
+def node_formats(dev: str) -> set[str] | None:
+    """Pixel formats a video node can capture (e.g. {'MJPG', 'YUYV'} or {'H264'}).
+    None if v4l2-ctl isn't installed or the node can't be read."""
+    try:
+        out = subprocess.run(["v4l2-ctl", "-d", dev, "--list-formats"], capture_output=True,
+                             text=True, timeout=5)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if out.returncode != 0:
+        return None
+    return set(_FOURCC_RE.findall(out.stdout))
+
+
+def auto_camera_node(codec: str, by_path_dir: str = "/dev/v4l/by-path", formats=node_formats) -> str | None:
+    """The USB node that provides what `codec` needs: H.264 for camera-h264, MJPEG otherwise.
+    Falls back to the first camera's first node if formats can't be read."""
+    want = "H264" if codec == "camera-h264" else "MJPG"
+    readable = False
+    for node in usb_video_nodes(by_path_dir):
+        f = formats(node)
+        if f is None:
+            continue
+        readable = True
+        if want in f:
+            return node
+    if readable and codec == "camera-h264":
+        return None          # formats were readable and nothing offers H.264
+    first = usb_camera_paths(by_path_dir)
+    return first[0] if first else None
+
+
+def parse_cameras(spec: str, default_size: str, by_path_dir: str = "/dev/v4l/by-path",
+                  codec: str = "h264", formats=node_formats) -> list[Camera]:
     w0, h0, fps0 = parse_size(default_size)
     fps0 = fps0 or 30
     if spec.strip().lower() in ("", "auto"):
-        return [Camera(dev, FIRST_PORT + i, w0, h0, fps0)
-                for i, dev in enumerate(usb_camera_paths(by_path_dir)[:1])]   # the ROV has one pilot camera
+        node = auto_camera_node(codec, by_path_dir, formats)   # the ROV has one pilot camera
+        return [Camera(node, FIRST_PORT, w0, h0, fps0)] if node else []
     cams = []
     for i, item in enumerate(spec.split()):
         # Split from the right: by-path names contain ':' themselves (usb-0:1:1.0)
@@ -143,12 +194,31 @@ def encoder_args(encoder: str, bitrate_kbps: int, keyint: int) -> list[str]:
 
 
 def build_pipeline(cam: Camera, host: str, codec: str, encoder: str | None,
-                   bitrate_kbps: int = 12000, keyint: int = 15) -> list[str]:
+                   bitrate_kbps: int = 12000, keyint: int = 15, h264parse: bool = True,
+                   jpegparse: bool = True, jpeg_quality: int = 0) -> list[str]:
+    caps = f"width={cam.width},height={cam.height},framerate={cam.fps}/1"
     src = ["v4l2src", f"device={cam.device}", "do-timestamp=true", "!",
-           f"image/jpeg,width={cam.width},height={cam.height},framerate={cam.fps}/1", "!"]
+           f"video/x-h264,{caps}" if codec == "camera-h264" else f"image/jpeg,{caps}", "!"]
     sink = ["udpsink", f"host={host}", f"port={cam.port}", "sync=false"]
-    if codec == "mjpeg":
-        body = ["rtpjpegpay", "pt=26", "!"]
+    if codec == "camera-h264":
+        # The camera already encodes H.264; just packetize it (same RTP format the topside expects)
+        # h264parse (gstreamer1-plugins-bad-free) is optional: rtph264pay takes the camera's
+        # byte-stream directly
+        body = (["h264parse", "!"] if h264parse else []) + \
+               ["rtph264pay", "config-interval=-1", "pt=96", "!"]
+    elif codec == "mjpeg":
+        # If the network stalls (Wi-Fi), drop stale frames here instead of sending a backlog late.
+        # Safe for MJPEG: every frame stands alone.
+        # jpegparse trims each frame to its real end (EOI). Some UVC cameras pad every MJPEG frame
+        # to a fixed size, and rtpjpegpay would send that padding over the network.
+        if jpeg_quality:
+            # Re-compress on the Pi: the UC-684's own JPEGs are ~170 kB (~40 Mbit/s) at any resolution,
+            # too much for Wi-Fi. Costs some CPU; frames stay independent (no smearing after a loss).
+            body = ["jpegdec", "!", "queue", "max-size-buffers=1", "leaky=downstream", "!",
+                    "jpegenc", f"quality={jpeg_quality}", "!", "rtpjpegpay", "pt=26", "!"]
+        else:
+            body = (["jpegparse", "!"] if jpegparse else []) + \
+                   ["queue", "max-size-buffers=1", "leaky=downstream", "!", "rtpjpegpay", "pt=26", "!"]
     elif codec == "h264":
         if not encoder:
             raise RuntimeError("no H.264 encoder installed (x264enc or openh264enc); "
@@ -159,7 +229,7 @@ def build_pipeline(cam: Camera, host: str, codec: str, encoder: str | None,
                 *encoder_args(encoder, bitrate_kbps, keyint), "!",
                 "rtph264pay", "config-interval=-1", "pt=96", "!"]
     else:
-        raise ValueError(f"codec must be h264 or mjpeg, not {codec!r}")
+        raise ValueError(f"codec must be one of {', '.join(CODECS)}, not {codec!r}")
     return ["gst-launch-1.0", *src, *body, *sink]
 
 
@@ -167,10 +237,24 @@ def build_pipeline(cam: Camera, host: str, codec: str, encoder: str | None,
 class CameraStreamer(threading.Thread):
     """Runs one gst-launch per camera and restarts it if it exits (unplugged, error)."""
 
-    def __init__(self, cam: Camera, argv: list[str], stop: threading.Event):
+    def __init__(self, cam: Camera, argv: list[str], stop: threading.Event, controls: str = ""):
         super().__init__(name=cam.label, daemon=True)
-        self.cam, self.argv, self.stop = cam, argv, stop
+        self.cam, self.argv, self.stop, self.controls = cam, argv, stop, controls
         self.proc: subprocess.Popen | None = None
+        self._controls_warned = False
+
+    def apply_controls(self) -> None:
+        cmd = controls_command(self.cam.device, self.controls)
+        if not cmd:
+            return
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+            ok, err = r.returncode == 0, (r.stderr or r.stdout).strip()
+        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            ok, err = False, str(e)
+        if not ok and not self._controls_warned:
+            log(f"[{self.cam.label}] couldn't set camera controls ({self.controls}): {err}")
+            self._controls_warned = True
 
     def run(self) -> None:
         waiting_logged = False
@@ -188,6 +272,7 @@ class CameraStreamer(threading.Thread):
             if not quiet:
                 log(f"[{self.cam.label}] {self.cam.width}x{self.cam.height}@{self.cam.fps} "
                     f"{os.path.basename(self.cam.device)} -> udp:{self.cam.port}")
+            self.apply_controls()
             started = time.monotonic()
             self.proc = subprocess.Popen(self.argv, stdout=subprocess.PIPE,
                                          stderr=subprocess.STDOUT, text=True, bufsize=1)
@@ -198,7 +283,7 @@ class CameraStreamer(threading.Thread):
                 if not line or line.startswith(("Setting pipeline", "Pipeline is", "New clock",
                                                 "Redistribute latency", "Prerolled")):
                     continue
-                if first_error is None and line.startswith("ERROR"):
+                if first_error is None and (line.startswith("ERROR") or "erroneous pipeline" in line):
                     first_error = line
                 if quiet and time.monotonic() - started < QUICK_FAIL_S:
                     held.append(line)            # print only if this run turns out to be different
@@ -258,18 +343,37 @@ def acquire_lock(path: str = LOCK_FILE):
     return fh
 
 
+def controls_command(device: str, controls: str) -> list[str] | None:
+    """v4l2-ctl command for a comma-separated control list, or None if there's nothing to set."""
+    controls = ",".join(c.strip() for c in controls.replace(" ", ",").split(",") if c.strip())
+    if not controls or not shutil.which("v4l2-ctl"):
+        return None
+    return ["v4l2-ctl", "-d", device, f"--set-ctrl={controls}"]
+
+
 def list_cameras() -> int:
-    paths = usb_camera_paths()
-    if not paths:
+    nodes = usb_video_nodes()
+    if not nodes:
         print("No USB cameras found under /dev/v4l/by-path (plugged in? try: ls /dev/v4l/by-path)")
         return 1
-    print("USB cameras (auto mode streams the first one to udp 5000):")
-    for i, p in enumerate(paths):
-        target = os.path.realpath(p)
-        print(f"  {i}: {p}\n     -> {target}")
-    if shutil.which("v4l2-ctl"):
-        print("\nFormats of the first camera (look for MJPG 1920x1080 30 fps):")
-        subprocess.run(["v4l2-ctl", "--list-formats-ext", "-d", paths[0]])
+    have_ctl = shutil.which("v4l2-ctl") is not None
+    print("USB video nodes:")
+    with_formats = []
+    for node in nodes:
+        f = node_formats(node) if have_ctl else None
+        desc = "formats unknown (install v4l-utils)" if f is None else (
+            ", ".join(sorted(f)) if f else "no video formats (metadata node)")
+        print(f"  {node}\n     -> {os.path.realpath(node)}   [{desc}]")
+        if f:
+            with_formats.append((node, f))
+    for codec in ("h264", "camera-h264"):
+        node = auto_camera_node(codec)
+        print(f"\nauto with ROV_VIDEO_CODEC={codec}: {node or 'no suitable node'}")
+    if any("H264" in f for _, f in with_formats):
+        print("\nThis camera outputs H.264 itself: ROV_VIDEO_CODEC=camera-h264 saves the Pi's CPU (no x264).")
+    for node, _ in with_formats:
+        print(f"\n--- {os.path.realpath(node)} (look for 1920x1080 30 fps) ---")
+        subprocess.run(["v4l2-ctl", "--list-formats-ext", "-d", node])
     return 0
 
 
@@ -280,11 +384,16 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--host", default=env.get("ROV_TOPSIDE_IP", "192.168.1.69"))
     ap.add_argument("--cam", action="append", metavar="DEV[:PORT[:WxH[@FPS]]]",
                     help="camera to stream (repeatable); default: ROV_CAMERAS or auto")
-    ap.add_argument("--codec", choices=("h264", "mjpeg"), default=env.get("ROV_VIDEO_CODEC", "h264"))
+    ap.add_argument("--codec", choices=CODECS, default=env.get("ROV_VIDEO_CODEC", "h264"))
     ap.add_argument("--bitrate", type=int, default=int(env.get("ROV_VIDEO_BITRATE", "12000")),
                     help="H.264 bitrate, kbit/s (default 12000)")
     ap.add_argument("--size", default=env.get("ROV_VIDEO_SIZE", "1920x1080@30"))
     ap.add_argument("--encoder", default=env.get("ROV_VIDEO_ENCODER", "auto"))
+    ap.add_argument("--jpeg-quality", type=int, default=int(env.get("ROV_JPEG_QUALITY", "0") or 0),
+                    help="mjpeg only: re-compress on the Pi at this JPEG quality (1-100; 0 = send the camera's frames)")
+    ap.add_argument("--controls", default=env.get("ROV_CAMERA_CONTROLS",
+                                                  "exposure_dynamic_framerate=0,power_line_frequency=2"),
+                    help="v4l2 camera controls to apply at start ('' = none)")
     ap.add_argument("--list", action="store_true", help="list cameras and exit")
     ap.add_argument("--dry-run", action="store_true", help="print the pipelines and exit")
     args = ap.parse_args(argv)
@@ -305,7 +414,7 @@ def main(argv: list[str] | None = None) -> int:
 
     host = args.host_ip or args.host
     spec = " ".join(args.cam) if args.cam else env.get("ROV_CAMERAS", "auto")
-    cams = parse_cameras(spec, args.size)
+    cams = parse_cameras(spec, args.size, codec=args.codec)
     if not cams:
         log("No USB camera found (auto). Plug it in, or set ROV_CAMERAS / --cam. Retrying in 5 s...")
         # Under systemd, exiting non-zero lets Restart= try again; don't spin
@@ -318,7 +427,14 @@ def main(argv: list[str] | None = None) -> int:
             encoder = args.encoder if args.encoder != "auto" else "x264enc"
         else:
             encoder = pick_encoder(args.encoder)
-    pipelines = [(c, build_pipeline(c, host, args.codec, encoder, args.bitrate)) for c in cams]
+    use_parser = args.dry_run or element_exists("h264parse")
+    use_jpegparse = args.dry_run or element_exists("jpegparse")
+    if args.codec == "mjpeg" and not use_jpegparse:
+        log("Note: jpegparse isn't installed (sudo dnf install -y gstreamer1-plugins-bad-free); "
+            "MJPEG frames are sent exactly as the camera delivers them, including any padding.")
+    pipelines = [(c, build_pipeline(c, host, args.codec, encoder, args.bitrate, h264parse=use_parser,
+                                    jpegparse=use_jpegparse, jpeg_quality=args.jpeg_quality))
+                 for c in cams]
 
     if args.dry_run:
         for c, p in pipelines:
@@ -326,9 +442,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     log(f"Sending {len(cams)} camera(s) to {host}, codec {args.codec}"
-        + (f" ({encoder}, {args.bitrate} kbit/s)" if args.codec == "h264" else ""))
+        + (f" ({encoder}, {args.bitrate} kbit/s)" if args.codec == "h264" else "")
+        + (f" (re-compressed at JPEG quality {args.jpeg_quality})" if args.codec == "mjpeg" and args.jpeg_quality else ""))
     stop = threading.Event()
-    streamers = [CameraStreamer(c, p, stop) for c, p in pipelines]
+    streamers = [CameraStreamer(c, p, stop, args.controls) for c, p in pipelines]
 
     def shutdown(signum, _frame):
         log(f"Stopping (signal {signum})")

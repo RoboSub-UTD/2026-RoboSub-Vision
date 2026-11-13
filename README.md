@@ -1,29 +1,41 @@
-# 2025 Hydromeda Camera Feed
+# ROV Vision (AlmaLinux 10)
 
-Uses GStreamer and OpenCV's Retinex to stream images from the ROV and
-perform color correction on captured frames.
+| Folder | Runs on | What it does |
+|---|---|---|
+| `topside/` | Topside laptop | Vision interface: live camera feed (UDP 5000), YOLO crab detection, photo panel for ROS captures |
+| `rov/` | Raspberry Pi 5 / CM5 | Camera sender: streams the UC-684 USB camera to the laptop (RTP over UDP) |
 
-The rov folder contains files that should be on the ROV controller, while
-topside contains files to be run on the topside computer.
+Video does not go through ROS, so a ROS problem can't take the pilot's video down.
 
-To use, copy the rov folder onto the ROV controller. Install GStreamer from install Python 3.11+,
-and install the requirements.txt file. Then, run stream.py with sudo, passing
-in the IP address of the topside computer as a command-line argument.
+## Setup
 
-Then, copy the topside folder to the topside computer.
+```bash
+# Pi
+cd rov && ./install_script.sh --service     # GStreamer, camera access, Wi-Fi power saving off, start on boot
+# edit rov/video.env: ROV_TOPSIDE_IP (Wi-Fi testing: laptop's Wi-Fi IP; tether: 192.168.1.69)
 
-Windows:
-1. Install GStreamer from the official website.
-2. Install Python 3.11+.
-3. Install the requirements.txt file using `pip3 install -r requirements.txt`.
-4. Run interface.py using `python3 interface.py`.
+# Laptop
+cd topside && ./install_script.sh && ./run.sh
+```
+Log out and back in once on the Pi after installing (video group).
 
-MacOS:
-1. Install GStreamer through homebrew.
-2. Follow the steps on this [SO answer](https://stackoverflow.com/a/60469203) to install tkinter and a modified pyenv installation.
-3. Install the requirements.txt file using `pip install -r requirements.txt`.
-4. Run interface.py using `python interface.py`.
+## Recommended settings (`rov/video.env`)
 
-Ubuntu:
-1. Run install.sh.
-2. Run interface.py using `python interface.py`.
+| | Size | Codec | `ROV_JPEG_QUALITY` |
+|---|---|---|---|
+| Tether (competition) | `1920x1080@30` | `mjpeg` | `0` (camera's own frames, ~45 Mbit/s, ~7% CPU) |
+| Wi-Fi testing | `1920x1080@30` | `mjpeg` | `0` (clean once the laptop isn't background-scanning) |
+| Weak link | `1280x720@30` | `mjpeg` | `70` (~17 Mbit/s, ~25% of a core) |
+
+The topside's `run.sh` defaults to `ROV_VIDEO_CODEC=mjpeg`; it must match the Pi.
+
+## Lag spikes or stutter
+
+Run both while streaming and compare:
+```bash
+./pi_check.sh 60                                  # Pi (rov/): Wi-Fi, CPU, temperature, USB, camera settings
+python3 video_check.py capture --seconds 60       # laptop (topside/), with the interface running
+```
+Lessons from testing: the camera disconnects if its USB plug is loose (secure it); Wi-Fi power saving and the
+laptop's periodic Wi-Fi scans (GNOME Location Services / Settings Wi-Fi page) cause regular lag spikes;
+the Pi 5 needs active cooling (it reached 85 C while streaming).
